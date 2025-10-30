@@ -1,0 +1,87 @@
+# ----------------------------------------
+# General
+# ----------------------------------------
+# OS-specific
+.DS_Store
+Thumbs.db
+
+# Python bytecode and cache
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Virtual environments
+venv/
+.env/
+.env.local
+.env.*.backup
+*.env.backup
+
+# ----------------------------------------
+# Docker & Compose
+# ----------------------------------------
+# Docker build and runtime files
+*.pid
+*.seed
+*.pid.lock
+docker-compose.override.yml
+docker-compose.dev.yml
+.docker/
+*.log
+
+# ----------------------------------------
+# Logs & Runtime Data
+# ----------------------------------------
+*.log
+logs/
+tmp/
+*.pid
+*.sock
+
+# ----------------------------------------
+# IDE / Editor files
+# ----------------------------------------
+.vscode/
+.idea/
+*.swp
+*.swo
+*.bak
+*.tmp
+
+# ----------------------------------------
+# Node (if you ever include frontend)
+# ----------------------------------------
+node_modules/
+npm-debug.log
+yarn-error.log
+dist/
+build/
+
+# ----------------------------------------
+# Backup / Misc
+# ----------------------------------------
+*.old
+*.orig
+*.rej
+*.zip
+*.tar.gz
+*.tgz
+
+# ----------------------------------------
+# Project-specific
+# ----------------------------------------
+# Sensitive environment files
+.env
+.env.local
+.env.production
+.env.development
+.env.test
+
+# Example files (keep these for documentation)
+!*.env.example
+!*.template.conf
+
+# Ignore your local secrets folder on the VM
+blue_green_secrets/
+.env
