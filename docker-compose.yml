@@ -32,7 +32,21 @@ services:
     ports:
       - "${NGINX_PUBLIC_PORT}:80"
     volumes:
-      - ./nginx/nginx.template.conf:/etc/nginx/nginx.template.conf
-      - ./nginx/entrypoint.sh:/docker-entrypoint.d/entrypoint.sh
+      - ./nginx/nginx.template.conf:/etc/nginx/nginx.template.conf:ro
+      - ./nginx/entrypoint.sh:/docker-entrypoint.d/entrypoint.sh:ro
+      - nginx_logs:/var/log/nginx     # shared log volume
     command: ["sh", "-c", "chmod +x /docker-entrypoint.d/entrypoint.sh && /docker-entrypoint.d/entrypoint.sh"]
     restart: unless-stopped
+
+  alert_watcher:
+    image: python:3.11-slim
+    env_file: .env
+    volumes:
+      - ./watcher:/app:ro
+      - nginx_logs:/var/log/nginx:ro
+    working_dir: /app
+    command: ["sh", "-c", "pip install -r requirements.txt && python watcher.py"]
+    restart: unless-stopped
+
+volumes:
+  nginx_logs:
