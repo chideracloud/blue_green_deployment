@@ -8,12 +8,11 @@ detects pool flips and elevated 5xx error rates, and posts alerts to Slack.
 import os
 import re
 import time
-import json
 import requests
 from collections import deque
 from datetime import datetime, timedelta
 
-# Configuration via environment (defaults provided)
+# --- Configuration via environment (defaults provided) ---
 LOG_PATH = os.environ.get("NGINX_LOG_PATH", "/var/log/nginx/access.log")
 SLACK_WEBHOOK = os.environ.get("SLACK_WEBHOOK_URL", "").strip()
 ERROR_RATE_THRESHOLD = float(os.environ.get("ERROR_RATE_THRESHOLD", "2.0"))  # percent
@@ -42,19 +41,26 @@ last_seen_pool = None
 last_failover_alert_ts = None
 last_error_rate_alert_ts = None
 
+# --- Alerting Functions ---
+
 def post_slack(text, attachments=None):
+    """Posts a message to Slack or prints to stdout if no webhook is configured."""
     payload = {"text": text}
     if attachments:
         payload["attachments"] = attachments
+    
+    now_utc = datetime.utcnow().isoformat()
     if SLACK_WEBHOOK:
         try:
             requests.post(SLACK_WEBHOOK, json=payload, timeout=5)
         except Exception as e:
-            print(f"[{datetime.utcnow().isoformat()}] Failed to post to Slack: {e}")
+            print(f"[{now_utc}] Failed to post to Slack: {e}")
     else:
-        print(f"[ALERT] {text}")
+        # Use a distinguishable format for stdout alerts
+        print(f"[{now_utc}] [*** ALERT ***] {text.replace('\\n', ' | ')}")
 
 def handle_line(line):
+    """Processes a single log line, detecting pool flips and error rate breaches."""
     global last_seen_pool, last_failover_alert_ts, last_error_rate_alert_ts
 
     m = LOG_RE.match(line)
@@ -65,81 +71,140 @@ def handle_line(line):
     pool = m.group("pool")
     release = m.group("release")
     upstream_status = m.group("upstream_status")
-    upstream_addr = m.group("upstream_addr")
-    request_time = m.group("request_time")
-    upstream_response_time = m.group("upstream_response_time")
-
-    # Detect pool flip
+    
+    # --- 1. Detect Pool Flip ---
+    now = datetime.utcnow()
     if last_seen_pool is None:
         last_seen_pool = pool
     elif pool != last_seen_pool:
-        # failover detected
-        now = datetime.utcnow()
+        # Failover detected
         if MAINTENANCE_MODE:
             print(f"[{now.isoformat()}] Maintenance mode ON: suppressing failover alert from {last_seen_pool}→{pool}")
         else:
-            if not last_failover_alert_ts or (now - last_failover_alert_ts).total_seconds() >= ALERT_COOLDOWN_SEC:
-                text = f":rotating_light: Failover detected: *{last_seen_pool}* → *{pool}*\nRelease: {release}\nUpstream: {upstream_addr}\nTime: {datetime.utcnow().isoformat()}Z"
+            cooldown_time_elapsed = (now - last_failover_alert_ts).total_seconds() >= ALERT_COOLDOWN_SEC if last_failover_alert_ts else True
+            
+            if cooldown_time_elapsed:
+                text = (
+                    f":rotating_light: Failover detected: *{last_seen_pool}* \u2192 *{pool}*\n" # Using unicode arrow
+                    f"Release: {release}\n"
+                    f"Time: {now.isoformat()}Z"
+                )
                 post_slack(text)
                 last_failover_alert_ts = now
             else:
                 print(f"[{now.isoformat()}] Failover detected but in cooldown, suppressed.")
+        
         last_seen_pool = pool
 
-    # Track errors for error rate (consider upstream_status or status)
+    # --- 2. Track errors for error rate ---
     is_error = False
-    # treat 5xx from upstream_status or main status as error
     try:
-        us = int(upstream_status) if upstream_status.isdigit() else 0
-    except:
+        # Treat 5xx from upstream_status or main status as error
+        us = int(upstream_status) if upstream_status.isdigit() and upstream_status != '-' else 0
+    except ValueError:
         us = 0
+        
     if 500 <= us < 600 or 500 <= status < 600:
         is_error = True
 
     rolling.append(1 if is_error else 0)
 
-    # Only evaluate once we have at least some entries (e.g., avoid division by zero)
-    if len(rolling) >= 10:  # small warming buffer
+    # Only evaluate once the window is reasonably full
+    if len(rolling) >= 10: 
         error_count = sum(rolling)
         total = len(rolling)
         error_rate = (error_count / total) * 100.0
 
         if error_rate >= ERROR_RATE_THRESHOLD:
-            now = datetime.utcnow()
+            cooldown_time_elapsed = (now - last_error_rate_alert_ts).total_seconds() >= ALERT_COOLDOWN_SEC if last_error_rate_alert_ts else True
+
             if MAINTENANCE_MODE:
                 print(f"[{now.isoformat()}] Maintenance mode ON: suppressing error-rate alert ({error_rate:.2f}%)")
+            elif cooldown_time_elapsed:
+                text = (
+                    f":warning: High upstream error rate detected: *{error_rate:.2f}%* "
+                    f"({error_count}/{total}) over last {total} requests.\n"
+                    f"Threshold: {ERROR_RATE_THRESHOLD}%\n"
+                    f"Time: {now.isoformat()}Z"
+                )
+                post_slack(text)
+                last_error_rate_alert_ts = now
             else:
-                if not last_error_rate_alert_ts or (now - last_error_rate_alert_ts).total_seconds() >= ALERT_COOLDOWN_SEC:
-                    text = f":warning: High upstream error rate detected: *{error_rate:.2f}%* ({error_count}/{total}) over last {total} requests.\nThreshold: {ERROR_RATE_THRESHOLD}%\nTime: {datetime.utcnow().isoformat()}Z"
-                    post_slack(text)
-                    last_error_rate_alert_ts = now
-                else:
-                    print(f"[{now.isoformat()}] Error rate {error_rate:.2f}% breached but in cooldown.")
-        # else: nothing to do
+                print(f"[{now.isoformat()}] Error rate {error_rate:.2f}% breached but in cooldown.")
 
-def follow(file):
-    """Tail a file forever, yielding new lines as they come in"""
-    file.seek(0,2)  # go to EOF
+# --- Tailing Logic with Rotation Handling ---
+
+def follow(filepath, delay=0.1):
+    """
+    Tails a file forever, yielding new lines as they come in.
+    Handles file rotation by checking inode and file size.
+    """
+    
+    # We open the file here instead of main() to support re-opening on rotation
     while True:
-        line = file.readline()
-        if not line:
-            time.sleep(0.1)
-            continue
-        yield line
+        try:
+            with open(filepath, 'r', encoding='utf-8', errors='ignore') as file:
+                # Go to EOF on first run or on re-open
+                file.seek(0, os.SEEK_END)
+                print(f"[{datetime.utcnow().isoformat()}] File opened. Starting tail from position: {file.tell()}")
+                
+                # Get initial inode for rotation check
+                initial_inode = os.fstat(file.fileno()).st_ino
+
+                while True:
+                    # Check for rotation: if inode or size has changed unexpectedly
+                    try:
+                        current_stat = os.fstat(file.fileno())
+                        if current_stat.st_ino != initial_inode:
+                            print(f"[{datetime.utcnow().isoformat()}] Log file rotated (inode changed). Re-opening.")
+                            break # Exit inner loop, triggers file re-open
+                        
+                        # Handle truncation (file smaller than current position)
+                        current_pos = file.tell()
+                        if current_stat.st_size < current_pos:
+                            print(f"[{datetime.utcnow().isoformat()}] Log file truncated/rotated (size decreased). Seeking to start.")
+                            file.seek(0)
+                            
+                    except FileNotFoundError:
+                        print(f"[{datetime.utcnow().isoformat()}] Log file disappeared. Waiting for it to reappear...")
+                        break # Exit inner loop, triggers file re-open
+                    except Exception as e:
+                        print(f"[{datetime.utcnow().isoformat()}] Error during file stat check: {e}")
+                        time.sleep(1) # Wait a bit before retry
+                        
+                    # Read lines
+                    line = file.readline()
+                    if not line:
+                        time.sleep(delay)
+                        continue
+                        
+                    yield line
+
+        except FileNotFoundError:
+            print(f"[{datetime.utcnow().isoformat()}] Waiting for log file {filepath}...")
+            time.sleep(5) # Wait longer for file to appear
+        except Exception as e:
+            print(f"[{datetime.utcnow().isoformat()}] Unexpected error in follow loop: {e}")
+            time.sleep(5)
+
+
+# --- Main Execution ---
 
 def main():
-    print(f"Watcher starting. Watching {LOG_PATH}")
-    # Ensure file exists
-    while not os.path.exists(LOG_PATH):
-        print(f"Waiting for log file {LOG_PATH}...")
-        time.sleep(1)
+    """Main execution point."""
+    print(f"Watcher starting. Configuration:")
+    print(f"- Log Path: {LOG_PATH}")
+    print(f"- Error Threshold: {ERROR_RATE_THRESHOLD}% / {WINDOW_SIZE} reqs")
+    print(f"- Alert Cooldown: {ALERT_COOLDOWN_SEC}s")
+    print(f"- Maintenance Mode: {'ON' if MAINTENANCE_MODE else 'OFF'}")
 
-    with open(LOG_PATH, "r", encoding="utf-8", errors="ignore") as f:
-        for line in follow(f):
-            try:
-                handle_line(line)
-            except Exception as e:
-                print(f"Error handling line: {e}; line: {line.strip()}")
+    # The file opening is now handled inside follow() to manage rotation
+    for line in follow(LOG_PATH):
+        try:
+            # Added a strip() just in case the line includes excessive whitespace
+            handle_line(line.strip())
+        except Exception as e:
+            print(f"[{datetime.utcnow().isoformat()}] Error handling line: {e}; line: {line.strip()}")
 
 if __name__ == "__main__":
     main()
