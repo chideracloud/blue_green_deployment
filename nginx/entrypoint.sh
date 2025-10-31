@@ -14,5 +14,8 @@ echo "==== Generated nginx.conf ===="
 cat $OUT
 echo "=============================="
 
+# Ensure log dir exists (mounted as volume)
+mkdir -p /var/log/nginx
+
 # Start nginx
 nginx -g "daemon off;"

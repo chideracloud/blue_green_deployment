@@ -30,23 +30,22 @@ services:
       - app_blue
       - app_green
     ports:
-      - "${NGINX_PUBLIC_PORT}:80"
+      - "${NGINX_PUBLIC_PORT}:80"  
     volumes:
-      - ./nginx/nginx.template.conf:/etc/nginx/nginx.template.conf:ro
-      - ./nginx/entrypoint.sh:/docker-entrypoint.d/entrypoint.sh:ro
-      - nginx_logs:/var/log/nginx     # shared log volume
-    command: ["sh", "-c", "chmod +x /docker-entrypoint.d/entrypoint.sh && /docker-entrypoint.d/entrypoint.sh"]
+      - ./nginx/nginx.template.conf:/etc/nginx/nginx.template.conf
+      - ./nginx/entrypoint.sh:/tmp/entrypoint.sh
+      - logs:/var/log/nginx   # shared volume
+    command: ["sh", "-c", "chmod +x /tmp/entrypoint.sh && /tmp/entrypoint.sh"]
     restart: unless-stopped
 
   alert_watcher:
-    image: python:3.11-slim
+    build: ./watcher
     env_file: .env
+    depends_on:
+      - nginx
     volumes:
-      - ./watcher:/app:ro
-      - nginx_logs:/var/log/nginx:ro
-    working_dir: /app
-    command: ["sh", "-c", "pip install -r requirements.txt && python watcher.py"]
+      - logs:/var/log/nginx
     restart: unless-stopped
 
 volumes:
-  nginx_logs:
+  logs:
