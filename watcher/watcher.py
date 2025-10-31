@@ -1,210 +1,180 @@
 #!/usr/bin/env python3
 """
-Log watcher for Blue/Green task.
-Tails /var/log/nginx/access.log, parses structured lines produced by nginx,
-detects pool flips and elevated 5xx error rates, and posts alerts to Slack.
+watcher.py
+Tails /var/log/nginx/access.log (structured log lines) and sends Slack alerts for:
+ - Failover events (pool change e.g. blue -> green)
+ - Elevated 5xx error rate over a sliding window
+Uses env vars from .env (via docker-compose env_file).
 """
 
 import os
-import re
 import time
-import requests
-from collections import deque
+import re
+import json
+import collections
 from datetime import datetime, timedelta
 
-# --- Configuration via environment (defaults provided) ---
-LOG_PATH = os.environ.get("NGINX_LOG_PATH", "/var/log/nginx/access.log")
-SLACK_WEBHOOK = os.environ.get("SLACK_WEBHOOK_URL", "").strip()
+import requests
+
+LOG_PATH = os.environ.get("NGINX_LOG_PATH", "/var/log/nginx/structured_access.log")
+SLACK_WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL")
+ACTIVE_POOL = os.environ.get("ACTIVE_POOL", "blue").lower()
 ERROR_RATE_THRESHOLD = float(os.environ.get("ERROR_RATE_THRESHOLD", "2.0"))  # percent
 WINDOW_SIZE = int(os.environ.get("WINDOW_SIZE", "200"))
 ALERT_COOLDOWN_SEC = int(os.environ.get("ALERT_COOLDOWN_SEC", "300"))
 MAINTENANCE_MODE = os.environ.get("MAINTENANCE_MODE", "false").lower() in ("1", "true", "yes")
 
-if not SLACK_WEBHOOK:
-    print("Warning: SLACK_WEBHOOK_URL not set. Alerts will be printed to stdout only.")
+if not SLACK_WEBHOOK_URL:
+    print("ERROR: SLACK_WEBHOOK_URL not set. Exiting.")
+    raise SystemExit(1)
 
-# Regex to parse the structured log format
-# Example: ... status=200 pool=blue release=v1.0 upstream_status=200 upstream_addr=172.19.0.3:8000 request_time=0.003 upstream_response_time=0.002 ...
+# pattern to extract key fields from structured nginx log lines
+# We logged: pool="...|..." release="...|..." upstream_status="..." upstream_addr="..." request_time="..."
 LOG_RE = re.compile(
-    r'.*status=(?P<status>\d+)\s+pool=(?P<pool>\S+)\s+release=(?P<release>\S+)\s+'
-    r'upstream_status=(?P<upstream_status>\S+)\s+upstream_addr=(?P<upstream_addr>\S+)\s+'
-    r'request_time=(?P<request_time>[\d\.]+)\s+upstream_response_time=(?P<upstream_response_time>[\d\.]+)'
+    r'pool="(?P<pool>[^"]+)"\s+release="(?P<release>[^"]+)"\s+upstream_status="(?P<upstream_status>[^"]*)"'
+    r'\s+upstream_addr="(?P<upstream_addr>[^"]*)"'
+    r'\s+request_time="(?P<request_time>[^"]*)"'
 )
 
-# Rolling window of last WINDOW_SIZE booleans (True if 5xx)
-rolling = deque(maxlen=WINDOW_SIZE)
-
-# Track last seen pool to detect flips
-last_seen_pool = None
-
-# Track cooldown timestamps for alerts
-last_failover_alert_ts = None
-last_error_rate_alert_ts = None
-
-# --- Alerting Functions ---
-
+# helper to post Slack message
 def post_slack(text, attachments=None):
-    """Posts a message to Slack or prints to stdout if no webhook is configured."""
     payload = {"text": text}
     if attachments:
         payload["attachments"] = attachments
-    
-    now_utc = datetime.utcnow().isoformat()
-    if SLACK_WEBHOOK:
-        try:
-            requests.post(SLACK_WEBHOOK, json=payload, timeout=5)
-        except Exception as e:
-            print(f"[{now_utc}] Failed to post to Slack: {e}")
-    else:
-        # Use a distinguishable format for stdout alerts
-        print(f"[{now_utc}] [*** ALERT ***] {text.replace('\\n', ' | ')}")
-
-def handle_line(line):
-    """Processes a single log line, detecting pool flips and error rate breaches."""
-    global last_seen_pool, last_failover_alert_ts, last_error_rate_alert_ts
-
-    m = LOG_RE.match(line)
-    if not m:
-        return
-
-    status = int(m.group("status"))
-    pool = m.group("pool")
-    release = m.group("release")
-    upstream_status = m.group("upstream_status")
-    
-    # --- 1. Detect Pool Flip ---
-    now = datetime.utcnow()
-    if last_seen_pool is None:
-        last_seen_pool = pool
-    elif pool != last_seen_pool:
-        # Failover detected
-        if MAINTENANCE_MODE:
-            print(f"[{now.isoformat()}] Maintenance mode ON: suppressing failover alert from {last_seen_pool}→{pool}")
-        else:
-            cooldown_time_elapsed = (now - last_failover_alert_ts).total_seconds() >= ALERT_COOLDOWN_SEC if last_failover_alert_ts else True
-            
-            if cooldown_time_elapsed:
-                text = (
-                    f":rotating_light: Failover detected: *{last_seen_pool}* \u2192 *{pool}*\n" # Using unicode arrow
-                    f"Release: {release}\n"
-                    f"Time: {now.isoformat()}Z"
-                )
-                post_slack(text)
-                last_failover_alert_ts = now
-            else:
-                print(f"[{now.isoformat()}] Failover detected but in cooldown, suppressed.")
-        
-        last_seen_pool = pool
-
-    # --- 2. Track errors for error rate ---
-    is_error = False
     try:
-        # Treat 5xx from upstream_status or main status as error
-        us = int(upstream_status) if upstream_status.isdigit() and upstream_status != '-' else 0
-    except ValueError:
-        us = 0
-        
-    if 500 <= us < 600 or 500 <= status < 600:
-        is_error = True
+        r = requests.post(SLACK_WEBHOOK_URL, json=payload, timeout=5)
+        if r.status_code >= 300:
+            print(f"Slack post failed {r.status_code}: {r.text}")
+    except Exception as e:
+        print("Slack send error:", e)
 
-    rolling.append(1 if is_error else 0)
+# tailer generator that yields new lines
+import time
 
-    # Only evaluate once the window is reasonably full
-    if len(rolling) >= 10: 
-        error_count = sum(rolling)
-        total = len(rolling)
-        error_rate = (error_count / total) * 100.0
-
-        if error_rate >= ERROR_RATE_THRESHOLD:
-            cooldown_time_elapsed = (now - last_error_rate_alert_ts).total_seconds() >= ALERT_COOLDOWN_SEC if last_error_rate_alert_ts else True
-
-            if MAINTENANCE_MODE:
-                print(f"[{now.isoformat()}] Maintenance mode ON: suppressing error-rate alert ({error_rate:.2f}%)")
-            elif cooldown_time_elapsed:
-                text = (
-                    f":warning: High upstream error rate detected: *{error_rate:.2f}%* "
-                    f"({error_count}/{total}) over last {total} requests.\n"
-                    f"Threshold: {ERROR_RATE_THRESHOLD}%\n"
-                    f"Time: {now.isoformat()}Z"
-                )
-                post_slack(text)
-                last_error_rate_alert_ts = now
-            else:
-                print(f"[{now.isoformat()}] Error rate {error_rate:.2f}% breached but in cooldown.")
-
-# --- Tailing Logic with Rotation Handling ---
-
-def follow(filepath, delay=0.1):
-    """
-    Tails a file forever, yielding new lines as they come in.
-    Handles file rotation by checking inode and file size.
-    """
-    
-    # We open the file here instead of main() to support re-opening on rotation
-    while True:
+def follow(filepath):
+    with open(filepath, "r", encoding="utf-8", errors="ignore") as f:
         try:
-            with open(filepath, 'r', encoding='utf-8', errors='ignore') as file:
-                # Go to EOF on first run or on re-open
-                file.seek(0, os.SEEK_END)
-                print(f"[{datetime.utcnow().isoformat()}] File opened. Starting tail from position: {file.tell()}")
-                
-                # Get initial inode for rotation check
-                initial_inode = os.fstat(file.fileno()).st_ino
-
-                while True:
-                    # Check for rotation: if inode or size has changed unexpectedly
-                    try:
-                        current_stat = os.fstat(file.fileno())
-                        if current_stat.st_ino != initial_inode:
-                            print(f"[{datetime.utcnow().isoformat()}] Log file rotated (inode changed). Re-opening.")
-                            break # Exit inner loop, triggers file re-open
-                        
-                        # Handle truncation (file smaller than current position)
-                        current_pos = file.tell()
-                        if current_stat.st_size < current_pos:
-                            print(f"[{datetime.utcnow().isoformat()}] Log file truncated/rotated (size decreased). Seeking to start.")
-                            file.seek(0)
-                            
-                    except FileNotFoundError:
-                        print(f"[{datetime.utcnow().isoformat()}] Log file disappeared. Waiting for it to reappear...")
-                        break # Exit inner loop, triggers file re-open
-                    except Exception as e:
-                        print(f"[{datetime.utcnow().isoformat()}] Error during file stat check: {e}")
-                        time.sleep(1) # Wait a bit before retry
-                        
-                    # Read lines
-                    line = file.readline()
-                    if not line:
-                        time.sleep(delay)
-                        continue
-                        
-                    yield line
-
-        except FileNotFoundError:
-            print(f"[{datetime.utcnow().isoformat()}] Waiting for log file {filepath}...")
-            time.sleep(5) # Wait longer for file to appear
-        except Exception as e:
-            print(f"[{datetime.utcnow().isoformat()}] Unexpected error in follow loop: {e}")
-            time.sleep(5)
+            if f.seekable():
+                f.seek(0, 2)  # Move to EOF only if seekable
+        except (OSError, IOError):
+            pass  # Ignore if stream is not seekable
+        while True:
+            line = f.readline()
+            if not line:
+                time.sleep(0.5)
+                continue
+            yield line
 
 
-# --- Main Execution ---
+def normalize_pool_field(raw):
+    """raw is like 'upstream_val|fallback_val'. prefer the first non-empty before '|'."""
+    parts = raw.split("|")
+    for p in parts:
+        p = p.strip()
+        if p and p.lower() != "-":
+            return p.lower()
+    return None
+
+def parse_upstream_status(raw):
+    """upstream_status may be empty or '200' or '200, 502'. take the last meaningful code."""
+    if not raw:
+        return None
+    # some logs may have comma-separated statuses; choose last numeric token
+    tokens = re.findall(r'\d{3}', raw)
+    return tokens[-1] if tokens else None
+
+def now_ts():
+    return datetime.utcnow().isoformat() + "Z"
 
 def main():
-    """Main execution point."""
-    print(f"Watcher starting. Configuration:")
-    print(f"- Log Path: {LOG_PATH}")
-    print(f"- Error Threshold: {ERROR_RATE_THRESHOLD}% / {WINDOW_SIZE} reqs")
-    print(f"- Alert Cooldown: {ALERT_COOLDOWN_SEC}s")
-    print(f"- Maintenance Mode: {'ON' if MAINTENANCE_MODE else 'OFF'}")
+    print(f"[{now_ts()}] watcher starting. Watching {LOG_PATH}")
+    last_seen_pool = ACTIVE_POOL
+    # rolling window of last WINDOW_SIZE booleans (True=5xx)
+    window = collections.deque(maxlen=WINDOW_SIZE)
+    total_seen = 0
 
-    # The file opening is now handled inside follow() to manage rotation
+    # cooldown trackers (dict of event_type -> datetime of last alert)
+    last_alert = {"failover": None, "error_rate": None}
+
+    # Ensure log exists before following
+    while not os.path.exists(LOG_PATH):
+        print(f"Waiting for log at {LOG_PATH} ...")
+        time.sleep(0.5)
+
     for line in follow(LOG_PATH):
-        try:
-            # Added a strip() just in case the line includes excessive whitespace
-            handle_line(line.strip())
-        except Exception as e:
-            print(f"[{datetime.utcnow().isoformat()}] Error handling line: {e}; line: {line.strip()}")
+        m = LOG_RE.search(line)
+        if not m:
+            # ignore unparseable lines but keep scanning
+            continue
+
+        raw_pool = m.group("pool")
+        pool = normalize_pool_field(raw_pool) or last_seen_pool
+        upstream_status_raw = m.group("upstream_status")
+        upstream_status = parse_upstream_status(upstream_status_raw)
+        upstream_addr = m.group("upstream_addr")
+        request_time = m.group("request_time")
+        release_raw = m.group("release")
+        release = normalize_pool_field(release_raw) or "unknown"
+
+        total_seen += 1
+
+        # determine if this request was an upstream 5xx
+        is_5xx = False
+        if upstream_status:
+            try:
+                code = int(upstream_status)
+                is_5xx = 500 <= code < 600
+            except ValueError:
+                is_5xx = False
+
+        window.append(1 if is_5xx else 0)
+
+        # compute error rate if window filled or partial
+        window_count = len(window)
+        error_sum = sum(window)
+        error_rate = (error_sum / window_count) * 100 if window_count > 0 else 0.0
+
+        # FAILOVER detection: when pool changes compared to last_seen_pool
+        if pool != last_seen_pool:
+            # Only alert if not in maintenance mode
+            if MAINTENANCE_MODE:
+                print(f"[{now_ts()}] Pool change detected ({last_seen_pool} -> {pool}) but maintenance mode ON, suppressing.")
+            else:
+                # cooldown check
+                last = last_alert.get("failover")
+                if not last or (datetime.utcnow() - last).total_seconds() > ALERT_COOLDOWN_SEC:
+                    text = f":rotating_light: *Failover detected* — {last_seen_pool} → {pool}\n" \
+                           f"Upstream: {upstream_addr}  release: {release}  time: {request_time}\n" \
+                           f"Sample log: `{line.strip()}`"
+                    post_slack(text)
+                    last_alert["failover"] = datetime.utcnow()
+                    print(f"[{now_ts()}] Sent failover alert: {last_seen_pool} -> {pool}")
+                else:
+                    print(f"[{now_ts()}] Failover detected but in cooldown; suppressed.")
+
+            last_seen_pool = pool
+
+        # ERROR RATE detection: check threshold when window has at least some entries
+        if window_count >= 10:  # start checking after a few requests to avoid noise
+            if error_rate > ERROR_RATE_THRESHOLD:
+                last = last_alert.get("error_rate")
+                if not last or (datetime.utcnow() - last).total_seconds() > ALERT_COOLDOWN_SEC:
+                    text = (f":warning: *High upstream error rate detected* — {error_rate:.2f}% 5xx "
+                            f"over last {window_count} requests (threshold {ERROR_RATE_THRESHOLD}%).\n"
+                            f"Current pool: {pool}  upstream: {upstream_addr}  release: {release}\n"
+                            f"Most recent log: `{line.strip()}`")
+                    post_slack(text)
+                    last_alert["error_rate"] = datetime.utcnow()
+                    print(f"[{now_ts()}] Sent error-rate alert: {error_rate:.2f}%")
+                else:
+                    print(f"[{now_ts()}] Error-rate high ({error_rate:.2f}%) but in cooldown; suppressed.")
+
+        # small heartbeat to stdout every 100 requests
+        if total_seen % 100 == 0:
+            print(f"[{now_ts()}] processed {total_seen} log lines; window={window_count} error_rate={error_rate:.2f}%")
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("Watcher exiting (keyboard interrupt).")
