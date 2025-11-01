@@ -12,6 +12,9 @@ This runbook explains the alerts produced by the watcher and suggested operator 
 2. Check Blue container health and logs:
 3. If Blue is unhealthy, inspect `/chaos` endpoints (if testing), resource usage, and application logs.
 4. After remediation, either allow auto-recovery or manually toggle `ACTIVE_POOL` back if required.
+   <img width="785" height="213" alt="image" src="https://github.com/user-attachments/assets/65bd94bb-746e-4426-a89d-7671d49dc3ae" />
+
+
 
 ### 2) High Error Rate
 **What it means:** The watcher detected that upstream 5xxs exceeded the configured threshold (ERROR_RATE_THRESHOLD) over the last WINDOW_SIZE requests.  
@@ -22,6 +25,8 @@ This runbook explains the alerts produced by the watcher and suggested operator 
 3. Inspect the application's logs:
 4. If necessary, toggle `ACTIVE_POOL` in `.env` and reload Nginx (planned maintenance).
 5. If it's an infrastructure problem (resource exhaustion), scale or restart containers.
+   <img width="796" height="219" alt="image" src="https://github.com/user-attachments/assets/d79915b7-399e-4958-af57-a032d03cbeff" />
+
 
 ### 3) Recovery Notices
 When the primary pool is healthy again, the watcher will detect pool flips back and may post a recovery message. Confirm app behavior and mark the incident as resolved.
